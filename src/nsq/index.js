@@ -103,11 +103,11 @@ const startRequeueSubscription = function () {
       crawlerRequeueConcurrency(crawlingHostname, msg.json()),
       parserRequeueConcurrency(crawlingHostname, msg.json())
     ]).then((got) => {
-      const gotFailed = _.filter(got, function (o) { return _.isObject(o) && o.failed ? true : false; });
-      if (gotFailed.length > 0) {
-        console.info('Requeue Concurrency FAILED!');
-        return msg.requeue(gotFailed[0].delay, backoff = true);
-      }
+      // const gotFailed = _.compact(got);
+      // if (gotFailed.length > 0) {
+      //   console.info('Requeue Concurrency FAILED!');
+      //   return msg.requeue(gotFailed[0].delay, backoff = true);
+      // }
       console.info('Requeue Concurrency Successfull!');
       console.log(got);
       return msg.finish();
