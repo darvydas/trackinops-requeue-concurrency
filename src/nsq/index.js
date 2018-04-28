@@ -16,10 +16,7 @@ NSQwriter.on('closed', function () {
   console.info('NSQ Writer closed Event');
 });
 
-const NSQreader = new nsq.Reader('trackinops.requeue-concurrency', 'Execute_requeue', {
-  lookupdHTTPAddresses: config.nsq.lookupdHTTPAddresses,
-  nsqdTCPAddresses: config.nsq.nsqdTCPAddresses
-});
+const NSQreader = new nsq.Reader('trackinops.requeue-concurrency', 'Execute_requeue', config.nsq.readerOptions);
 NSQreader.connect();
 NSQreader.on('ready', function () {
   console.info(`NSQ Reader ready on nsqlookupd:${config.nsq.lookupdHTTPAddresses}`);
@@ -48,39 +45,26 @@ process.on('SIGINT', function () {
   process.exit(0);
 })
 
-const publishCrawlerRequest = function (topic = "trackinops.crawler.000", url, uniqueUrl, executionDoc) {
+
+const publishParserCrawlerRequest = function (topic = "trackinops.parser-crawler.000", url, uniqueUrl, website, requestId) {
   return new Promise(function (resolve, reject) {
     NSQwriter.publish(topic, {
       url: url,
       uniqueUrl: uniqueUrl,
-      executionDoc: executionDoc
+      website: website,
+      requestId: requestId,
+      timestamp: Date.now()
     }, function (err) {
       if (err) {
-        console.error(`NSQwriter Crawler Request publish Error: ${err.message}`);
+        console.error(`NSQwriter Request publish Error: ${err.message}`);
         return reject(err);
       }
-      console.info(`Crawler Request sent to NSQ, 150 chars: ${uniqueUrl.substring(0, 150)}`);
+      console.info(`Request sent to NSQ, 150 chars: ${uniqueUrl.substring(0, 150)}`);
       return resolve();
     })
   })
 }
 
-const publishParserRequest = function (topic = "trackinops.parser.000", url, uniqueUrl, executionDoc) {
-  return new Promise(function (resolve, reject) {
-    NSQwriter.publish(topic, {
-      url: url,
-      uniqueUrl: uniqueUrl,
-      executionDoc: executionDoc
-    }, function (err) {
-      if (err) {
-        console.error(`NSQwriter Parser Request publish Error: ${err.message}`);
-        return reject(err);
-      }
-      console.info(`Parser Request sent to NSQ, 150 chars: ${uniqueUrl.substring(0, 150)}`);
-      return resolve();
-    })
-  })
-}
 /**
 * @public
 *  // @paramm {String} routingKey - where to requeue
@@ -99,47 +83,85 @@ const startRequeueSubscription = function () {
     console.info(`Received message [${msg.id}]`);
     const crawlingHostname = new URI(msg.json().url).hostname();
 
-    return Promise.all([
-      crawlerRequeueConcurrency(crawlingHostname, msg.json()),
-      parserRequeueConcurrency(crawlingHostname, msg.json())
-    ]).then((got) => {
-      // const gotFailed = _.compact(got);
-      // if (gotFailed.length > 0) {
+    if (msg.json().sendTo == 'Parser') {
+      return Promise.all([
+        parserRequeueConcurrency(crawlingHostname, msg.json())
+      ]).then((got) => {
+        // const gotFailed = _.compact(got);
+        // if (gotFailed.length > 0) {
+        //   console.info('Requeue Concurrency FAILED!');
+        //   return msg.requeue(gotFailed[0].delay, backoff = true);
+        // }
+        console.info('Parser Requeue Concurrency Successfull!');
+        console.log(got);
+        return msg.finish();
+      }).catch((err) => {
+        console.info('Parser Requeue Concurrency FAILED!');
+        console.error(err);
+        if (err && err.failed && err.delay && err.backoff)
+          return msg.requeue(delay = err.delay, backoff = err.backoff);
+        return msg.requeue(delay = 0, backoff = true);
+      });
+    }
+    if (msg.json().sendTo == 'Crawler') {
+      // TODO: to include website and other data
+      // return Promise.all([
+      //   crawlerRequeueConcurrency(crawlingHostname, msg.json()),
+      // ]).then((got) => {
+      //   // const gotFailed = _.compact(got);
+      //   // if (gotFailed.length > 0) {
+      //   //   console.info('Requeue Concurrency FAILED!');
+      //   //   return msg.requeue(gotFailed[0].delay, backoff = true);
+      //   // }
+      //   console.info('Requeue Concurrency Successfull!');
+      //   console.log(got);
+      //   return msg.finish();
+      // }).catch((err) => {
       //   console.info('Requeue Concurrency FAILED!');
-      //   return msg.requeue(gotFailed[0].delay, backoff = true);
-      // }
-      console.info('Requeue Concurrency Successfull!');
-      console.log(got);
-      return msg.finish();
-    }).catch((err) => {
-      console.info('Requeue Concurrency FAILED!');
-      console.error(err);
-      if (err.failed && err.delay && err.backoff)
-        return msg.requeue(delay = err.delay, backoff = err.backoff);
-      return msg.requeue(delay = 0, backoff = true);
-    });
+      //   console.error(err);
+      //   if (err && err.failed && err.delay && err.backoff)
+      //     return msg.requeue(delay = err.delay, backoff = err.backoff);
+      //   return msg.requeue(delay = 0, backoff = true);
+      // });
+    }
+
+    if (msg.attempts < 51) { // repeat 50 failed times
+      // delay 1..50 minutes every time
+      msg.requeue(delay = msg.attempts * 60 * 1000, backoff = true)
+    }
+    // if more than 50 attempts, then finish
+    msg.finish();
   });
+
 }
 
 function crawlerRequeueConcurrency(crawlingHostname, msg) {
-  return requeueConcurrency(crawlingHostname, 'trackinops.crawler.', msg)
+  return crawlerUrlRegexMatches(msg.url, msg.executionDoc.followLinks.crawlerUrlRegex)
     .then(() => {
-      console.info('Crawler Requeue Concurrency Successfull!');
-      return Promise.resolve();
+      return requeueConcurrency(crawlingHostname, 'trackinops.crawler.', msg)
+        .then(() => {
+          console.info('Crawler Requeue Concurrency Successfull!');
+          return Promise.resolve();
+        })
     }).catch((err) => {
       console.info('Crawler Requeue Concurrency FAILED!');
       console.error(err);
-      if (err.delay && err.backoff)
+      if (err && err.delay && err.backoff)
         return Promise.resolve({ failed: true, delay: 30, backoff: true });
       return Promise.resolve({ failed: true });
     });
 }
+
+function crawlerUrlRegexMatches(url, crawlerUrlRegex) {
+  return new Promise((resolve, reject) => {
+    return new RegExp(crawlerUrlRegex).test(url) ? resolve() : reject();
+  })
+}
+
 function parserRequeueConcurrency(crawlingHostname, msg) {
-
-
-  return parserUrlRegexMatches(msg.executionDoc.crawlMatches, msg.url)
+  return parserUrlRegexMatches(msg.website.parserSettings.parserMatches, msg.url)
     .then(() => {
-      requeueConcurrency(crawlingHostname, 'trackinops.parser.', msg)
+      return requeueConcurrency(crawlingHostname, 'trackinops.parser.', msg)
         .then(() => {
           console.info('Parser Requeue Concurrency Successfull!');
           return Promise.resolve();
@@ -152,21 +174,21 @@ function parserRequeueConcurrency(crawlingHostname, msg) {
     .catch((err) => {
       console.info('Parser Requeue Concurrency FAILED!');
       console.error(err);
-      if (err.delay && err.backoff)
+      if (err && err.delay && err.backoff)
         return Promise.resolve({ failed: true, delay: 30, backoff: true });
       return Promise.resolve({ failed: true });
     });
 }
 
-function parserUrlRegexMatches(crawlMatches, url) {
-  return Promise.all(crawlMatches.map(function (cMatch) {
+function parserUrlRegexMatches(parserMatches, url) {
+  return Promise.all(parserMatches.map(function (pMatch) {
     let regexMatch = false;
     let checkUrl = url;
-    if (!cMatch.urlRegEx) return cMatch;
+    if (!pMatch.urlRegEx) return pMatch;
 
-    if (cMatch.urlRegEx !== null && cMatch.urlRegEx.length > 0) {
+    if (pMatch.urlRegEx !== null && pMatch.urlRegEx.length > 0) {
       // replaces [] to ()
-      let matchStr = cMatch.urlRegEx.replace(/\[/g, '(').replace(/\]/g, ')');
+      let matchStr = pMatch.urlRegEx.replace(/\[/g, '(').replace(/\]/g, ')');
       if (_.endsWith(matchStr, '/')) {
         // removes trailing slash
         matchStr = matchStr.substring(0, matchStr.length - 1);
@@ -174,14 +196,14 @@ function parserUrlRegexMatches(crawlMatches, url) {
       if (_.endsWith(checkUrl, '/')) {
         checkUrl = checkUrl.substring(0, checkUrl.length - 1);
       }
-      let patt = new RegExp('^' + matchStr + '$');
+      let patt = new RegExp(matchStr);
       regexMatch = patt.test(checkUrl);
     }
-    if (regexMatch) return cMatch;
+    if (regexMatch) return pMatch;
   }))
-    .then(function (crawlMatchesAfterRegexCheck) {
+    .then(function (parserMatchesAfterRegexCheck) {
       // evaluate elements on the page
-      const regexMatched = _.compact(crawlMatchesAfterRegexCheck);
+      const regexMatched = _.compact(parserMatchesAfterRegexCheck);
       console.info(url, 'regexMatched', regexMatched);
       if (regexMatched.length > 0) return Promise.resolve();
       return Promise.reject();
@@ -199,7 +221,7 @@ function requeueConcurrency(crawlingHostname, prefix, msg) {
       // if exists publish to founded topic and finish message
       if (founded.topic) {
         // TODO: should check if this topic is alive and running
-        return Queue.publishCrawlerRequest(founded.topic, msg.url, msg.uniqueUrl, msg.executionDoc)
+        return Queue.publishParserCrawlerRequest(founded.topic, msg.url, msg.uniqueUrl, msg.website, msg.requestId)
           .error((err) => {
             console.error(new Error(err));
             return Promise.reject(new Error(err));
@@ -214,7 +236,7 @@ function requeueConcurrency(crawlingHostname, prefix, msg) {
             // save given domain for chosen topic name in LvlDB
             return levelDBput(publishTo.topic, crawlingHostname)
               .then(() => {
-                return Queue.publishCrawlerRequest(publishTo.topic, msg.url, msg.uniqueUrl, msg.executionDoc)
+                return Queue.publishParserCrawlerRequest(publishTo.topic, msg.url, msg.uniqueUrl, msg.website, msg.requestId)
                   .error((err) => {
                     console.error(new Error(err));
                     return Promise.reject();
@@ -269,7 +291,7 @@ function chooseTopicNameToPublish({ prefix, lookupd }) {
     })
 }
 
-function queryLookupdTopics(lookupdHTTPAddresses, prefix = 'trackinops.') {
+function queryLookupdTopics(lookupdHTTPAddresses, prefix) {
   return rp({
     uri: `http://${lookupdHTTPAddresses}/nodes`,
     // qs: {
@@ -423,7 +445,6 @@ function levelDBdel() {
 }
 
 exports = module.exports = Queue = {
-  publishCrawlerRequest: publishCrawlerRequest,
-  publishParserRequest: publishParserRequest,
+  publishParserCrawlerRequest: publishParserCrawlerRequest,
   startRequeueSubscription: startRequeueSubscription
 };
